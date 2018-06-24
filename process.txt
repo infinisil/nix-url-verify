@@ -1,0 +1,18 @@
+1. use urls.nix to find all top-level src urls with nix-instantiate
+2. If possible, do it recursively, but ya can't catch x.y errors where y doesn't exist
+3. Different architectures?
+4. Go through each file and url in the result, parse the file with hnix, find find the url in it (skip if url not present), will give source location
+  4b. Url could be composite, e.g. "foo${version}bar". Will have to check for such strings with hnix and match the version part to the url we have.
+5. Verify the url (https?, redirect?, 404?) -> gives new url
+6. If url was composite, find the version in it and replace it with the string "${version}", abort if something doesn't match
+7. For changed urls:
+  - fetch/do a build of the source, check the hash. If correct -> replace with new url
+	- If incorrect, check if old url works. If old one works, our replacement doesn't work, log and continue
+	- If the old one doesn't work either -> output "package can't be built anymore"
+
+
+- Only check same url once
+- Evaluate nixpkgs with fixed system
+- Add a whitelist of things that shouldn't be changed (generated stuff)
+- Support non top-level (list of attributes to check as well)
+- Use hnix for everything? Would certainly make the recursive thing possible
