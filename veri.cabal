@@ -25,3 +25,8 @@ executable veri
                      , unordered-containers
                      , data-fix
                      , exceptions
+                     , aeson
+                     , bytestring
+                     , regex-tdfa
+                     , megaparsec
+                     , regex-applicative
