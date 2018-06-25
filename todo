@@ -1,0 +1,4 @@
+Handle mirrors (mirror:// and replace with mirror:// on redirect to one)
+Handle CDN redirects (some long hash in final name)
+Handle ? and #
+Implement rules (e.g. don't go through amazonaws redirects)
