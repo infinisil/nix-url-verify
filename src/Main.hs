@@ -1,174 +1,186 @@
-{-# LANGUAGE DeriveGeneric     #-}
-{-# LANGUAGE LambdaCase        #-}
-{-# LANGUAGE NamedFieldPuns    #-}
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE LambdaCase          #-}
+{-# LANGUAGE NamedFieldPuns      #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 module Main where
 
-import           Data.Aeson             hiding (Success)
-import qualified Data.ByteString        as BS
+import           Control.Exception.Base
+import           Control.Monad
+import           Data.Aeson                hiding (Success)
+import qualified Data.ByteString.Char8     as BS
 import           Data.Either
-import           Data.Maybe             (mapMaybe)
+import           Data.Foldable
+import           Data.Functor.Identity
+import           Data.Maybe                (catMaybes, fromJust, mapMaybe)
 import           Data.Semigroup
-import           Data.Text              (Text)
-import qualified Data.Text              as Text
+import           Data.Text                 (Text)
+import qualified Data.Text                 as Text
+import qualified Data.Text.IO              as TIO
 import           GHC.Generics
-import           Nix                    hiding (try)
-import           Text.Megaparsec.Pos    (pos1)
+import           Network.HTTP.Client
+import           Network.HTTP.Client.TLS
+import           Network.HTTP.Types.Status
+import           Network.URI               hiding (path)
+import           Nix
+import           System.IO
+import           Text.Megaparsec.Pos       (Pos, pos1)
 import           Text.Regex.Applicative
-
-data Path = Path
-  { file :: FilePath
-  , line :: Int
-  } deriving (Generic, Show)
 
 data Entry = Entry
   { name :: String
-  , path :: Path
-  , urls :: [Text]
+  , file :: FilePath
+  , urls :: [String]
   } deriving (Generic, Show)
 
-instance FromJSON Path
 instance FromJSON Entry
 
+type Str = (NString NExprLoc, SrcSpan)
 
+-- Finds all strings that could be accessed in an expression
 findStrings :: NExprLoc -> [Str]
 findStrings (AnnE s (NStr str)) = [(str, s)]
-findStrings (AnnE _ (NList vals)) = concatMap findStrings vals
-findStrings (AnnE _ (NSet bindings)) = concatMap (\case
-                                                     NamedVar _ val _ -> findStrings val
-                                                     Inherit {} -> []
-                                                    ) bindings
-findStrings (AnnE _ (NRecSet bindings)) = concatMap (\case
-                                                     NamedVar _ val _ -> findStrings val
-                                                     Inherit {} -> []
-                                                    ) bindings
-findStrings (AnnE _ (NUnary _ val)) = findStrings val
-findStrings (AnnE _ (NBinary _ left right)) = findStrings left ++ findStrings right
-findStrings (AnnE _ (NSelect left _ Nothing)) = findStrings left
-findStrings (AnnE _ (NSelect left _ (Just right))) = findStrings left ++ findStrings right
-findStrings (AnnE _ (NAbs _ val)) = findStrings val
-findStrings (AnnE _ (NLet bindings val)) = findStrings val ++ concatMap (\case
-                                                     NamedVar _ val _ -> findStrings val
-                                                     Inherit {} -> []
-                                                    ) bindings
-findStrings (AnnE _ (NIf _ left right)) = findStrings left ++ findStrings right
-findStrings (AnnE _ (NWith left right)) = findStrings left ++ findStrings right
-findStrings (AnnE _ (NAssert _ val)) = findStrings val
-findStrings _ = []
+findStrings (AnnE _ val) = let
+    inBinding (NamedVar _ val _) = findStrings val
+    inBinding Inherit {}         = []
+  in case val of
+    (NList vals) -> concatMap findStrings vals
+    (NSet bindings) -> concatMap inBinding bindings
+    (NRecSet bindings) -> concatMap inBinding bindings
+    (NUnary _ val) -> findStrings val
+    (NBinary _ left right) -> findStrings left ++ findStrings right
+    (NSelect left _ Nothing) -> findStrings left
+    (NSelect left _ (Just right)) -> findStrings left ++ findStrings right
+    (NAbs _ val) -> findStrings val
+    (NLet bindings val) -> findStrings val ++ concatMap inBinding bindings
+    (NIf _ left right) -> findStrings left ++ findStrings right
+    (NWith left right) -> findStrings left ++ findStrings right
+    (NAssert _ val) -> findStrings val
+    _ -> []
 
--- Nothing: Antiquoted
--- Just: Fixed text
-toThing :: Str -> Maybe [Maybe (SrcSpan, Text)]
-toThing (DoubleQuoted parts, span) = convertParts (span { spanBegin = (spanBegin span) { sourceColumn = pos1 Data.Semigroup.<> sourceColumn (spanBegin span) } }) parts
+newtype Pattern = Pattern [Maybe Text]
+
+extractPattern :: Str -> Maybe ([(Text, SrcSpan)], Pattern)
+extractPattern (Indented _ _, _) = Nothing
+extractPattern (DoubleQuoted parts, span) = convertParts (span { spanBegin = (spanBegin span) { sourceColumn = pos1 Data.Semigroup.<> sourceColumn (spanBegin span) } }) parts
   where
-    convertParts :: SrcSpan -> [Antiquoted Text NExprLoc] -> Maybe [Maybe (SrcSpan, Text)]
-    convertParts span [] = Just []
+    convertParts :: SrcSpan -> [Antiquoted Text NExprLoc] -> Maybe ([(Text, SrcSpan)], Pattern)
+    convertParts span [] = Just ([], Pattern [])
     convertParts span (Plain text:rest) = do
       let endpoint = if Text.length text == 1 then sourceColumn (spanBegin span) else sourceColumn (spanBegin span) Data.Semigroup.<> mkPos (Text.length text - 1)
       let newspan = span { spanBegin = (spanBegin span) { sourceColumn = endpoint Data.Semigroup.<> pos1 } }
-      r <- convertParts newspan rest
-      return $ Just (SrcSpan
-                     { spanBegin = spanBegin span
-                     , spanEnd = (spanBegin span)
-                       { sourceColumn = endpoint }
-                     }, text) : r
+      (spans, Pattern patts) <- convertParts newspan rest
+      return ((text, SrcSpan
+               { spanBegin = spanBegin span
+               , spanEnd = (spanBegin span)
+                 { sourceColumn = endpoint }
+               }) : spans
+             , Pattern (Just text : patts))
     convertParts span (EscapedNewline:rest) = Nothing
     convertParts span (Antiquoted (AnnE s val):rest) = do
-      let newspan = span { spanBegin = (spanBegin span) { sourceColumn = pos1 Data.Semigroup.<> sourceColumn (spanEnd s) } }
-      r <- convertParts newspan rest
-      return $ Nothing : r
-toThing (Indented _ _, _) = Nothing
+      let len = unPos (sourceColumn (spanEnd s)) - unPos (sourceColumn (spanBegin s)) + 3
+      let newspan = span { spanBegin = (spanBegin span) { sourceColumn = mkPos len Data.Semigroup.<> (sourceColumn (spanBegin span)) } }
+      (spans, Pattern patts) <- convertParts newspan rest
+      -- TODO Merge antiquote patterns in a row
+      return (spans, Pattern (Nothing : patts))
 
+maybeMatch :: String -> Pattern -> Maybe [Maybe Text]
+maybeMatch text (Pattern patt) = match (traverse matchPatt patt) text
+  where
+    matchPatt :: Maybe Text -> RE Char (Maybe Text)
+    matchPatt Nothing     = Just . Text.pack <$> many anySym
+    matchPatt (Just text) = const Nothing <$> string (Text.unpack text)
 
-parseThing :: Maybe (a, Text) -> RE Char (Either (Text, a) Text)
-parseThing Nothing = Right . Text.pack <$> many anySym
-parseThing (Just (span, text)) = const (Left (text, span)) <$> string (Text.unpack text)
+updateUrl :: Manager -> String -> IO String
+updateUrl mng url = case parseURI url of
+  Nothing -> do
+    --putStrLn $ "Couldn't parse uri " ++ url
+    return url
+  Just uri -> case requestFromURI uri of
+    Nothing -> do
+      --putStrLn $ "Can't handle " ++ url
+      return url
+    Just request -> do
+      if secure request then do
+          --putStrLn "Is secure already"
+          return url
+        else do
+          let secureRequest = fromJust $ requestFromURI (uri { uriScheme = "https:" })
+          putStrLn $ "Replacing with secure url (" ++ url ++ ")"
+          handle (\(e :: SomeException) -> do
+                     putStrLn $ "Got exception: " ++ show e
+                     return url) $ withResponseHistory secureRequest mng $ \hr -> do
+            let req = hrFinalRequest hr
+            let status = statusCode . responseStatus . hrFinalResponse $ hr
+            if status < 200 || status >= 300
+              then do
+                putStrLn $ "Status code is " ++ show status
+                return url
+              else do
+                let final = "https://" ++ BS.unpack (host req) ++ BS.unpack (path req)
+                putStrLn $ "Got final url: " ++ final
+                return final
 
-parseMany :: [Maybe (a, Text)] -> RE Char [Either (Text, a) Text]
-parseMany = traverse parseThing
+matchString :: String -> Str -> Maybe (SrcSpan, [(Text, SrcSpan)], Pattern)
+matchString url str@(_, span) = do
+  (src, patt) <- extractPattern str
+  newpatt <- Pattern <$> maybeMatch url patt
+  return (span, src, newpatt)
 
-doMatch :: Text -> [Maybe (a, Text)] -> Maybe [Either (Text, a) Text]
-doMatch url parts = match (traverse parseThing parts) (Text.unpack url)
+replaceLine :: Text -> [(Int, Int, Text)] -> Text
+replaceLine = foldr (\(start, end, newtext) line -> Text.take start line <> newtext <> Text.drop end line)
+-- file: Which file to replace in
+-- line: Which line in the file to replace
+-- replacements: List of replacement pairs (start column, end column, new text)
+replaceInFile :: FilePath -> (Int, Int) -> [(Int, Int, Text)] -> IO ()
+replaceInFile file (line, column) replacements = do
+  lines <- Text.lines <$> TIO.readFile file
+  let oldline = lines !! line
+  print column
+  let hasQuotes = Text.index oldline column == '"'
+  --print $ "Is quote: " ++ show hasQuotes
+  let newline = replaceLine oldline (if hasQuotes
+                                     then map (\(from, to, newtext) -> (from - 1, to, newtext)) replacements
+                                     else map (\(from, to, newtext) -> (from - 2, to - 1, newtext)) replacements)
+  let newlines = take line lines ++ [newline] ++ drop (line + 1) lines
+  --putStrLn $ "Replacing " ++ show oldline ++ " with " ++ show newline
+  TIO.writeFile file (Text.unlines newlines)
 
-match' :: Text -> Str -> Maybe MatchedUrl
-match' url str = do
-  res <- toThing str
-  x <- match (parseMany res) (Text.unpack url)
-  return $ MatchedUrl x
+handleUrl :: Manager -> FilePath -> NExprLoc -> String -> IO ()
+handleUrl mng path expr url = case mapMaybe (matchString url) (findStrings expr) of
+  [] -> return ()--putStrLn $ "Url " ++ show url ++ " not found"
+  [(sp, src, newpatt)] -> do
+    -- src is the info on the original sections in our file
+    -- newpatt is the pattern to match the new url against
+    --putStrLn "Found"
+    newurl <- updateUrl mng url
+    case maybeMatch newurl newpatt of
+      Nothing -> return ()--putStrLn "New url didn't match"
+      Just res -> if newparts == map fst src then return () {-putStrLn "No changes"-} else do
+        replaceInFile path ((\x -> x - 1) . unPos . sourceLine . spanBegin . snd . head $ src, (\x -> x - 1) . unPos . sourceColumn . spanBegin $ sp)
+          $ zipWith (\(_, span) newtext -> (unPos $ sourceColumn (spanBegin span), unPos $ sourceColumn (spanEnd span), newtext)) src newparts
+        putStrLn $ "Changed from " ++ show url ++ " to " ++ show newurl
+        where newparts = catMaybes res
+  _ -> return () --putStrLn $ "Ambiguous url " ++ show url
 
-toPatterns :: [Antiquoted Text NExprLoc] -> Maybe [Either Char NExprLoc]
-toPatterns [] = Just []
-toPatterns (Plain text:rest) = do
-  r <- toPatterns rest
-  let this = map Left $ Text.unpack text
-  return $ this ++ r
-toPatterns (EscapedNewline:rest) = Nothing
-toPatterns (Antiquoted val:rest) = do
-  r <- toPatterns rest
-  return $ Right val : r
-
-type Str = (NString NExprLoc, SrcSpan)
--- Left: Plain text
--- Right: Matched aniquotation
-newtype MatchedUrl = MatchedUrl [Either (Text, SrcSpan) Text] deriving Show
-
--- To replace: query url again, match again, Text parts should match, replace SrcSpan parts
-
-findUrl :: Text -> NExprLoc -> Either String MatchedUrl
-findUrl url expr = case mapMaybe (match' url) $ findStrings expr of
-  []  -> Left "Url not found"
-  [m] -> Right m
-  _   -> Left "Ambiguous"
-
-updateUrl :: Text -> IO Text
-updateUrl url = return $ "h" <> url <> "/"
-
-handleUrl :: NExprLoc -> Text -> IO ()
-handleUrl expr url = do
-  let stringPatterns = mapMaybe toThing $ findStrings expr
-  let theStringPattern = mapMaybe (doMatch url) stringPatterns
-  case findUrl url expr of
-    Left error -> print error
-    Right (MatchedUrl m) -> do
-      let inverted = map (\x -> case x of
-                             Left (text, span) -> Nothing
-                             Right text        -> Just ((), text)) m
-      print "Matched"
-      newurl <- updateUrl url
-      print $ "Finding url " ++ show newurl
-      -- TODO: Need to switch around: Previously fixed strings should be .*, previously antiquoted parts should be fixed (be determined the values with the first match)
-      -- This way we can vary only the previously fixed parts. Match the url with the new pattern
-
-      -- To replace: Replace the source spans from the back to the front -> Doesn't change the indices
-      case findUrl newurl expr of
-        Left error -> do
-          print "Didn't match the second time"
-        Right (MatchedUrl m') -> do
-          print $ "COMPARING: " <> show (rights m) <> " AND " <> show (rights m')
-          if rights m == rights m'
-            then do
-              print "IS MATCHING"
-              print $ "CAN REPLACE " <> show (map fst (lefts m)) <> " WITH " <> show (map fst (lefts m'))
-            else do
-              print "NOT MATCHING"
-
-          return ()
-
-handleEntry :: Entry -> IO ()
-handleEntry Entry { urls, path } = do
-  res <- parseNixFileLoc (file path)
+handleEntry :: Manager -> Entry -> IO ()
+handleEntry mng Entry { urls, file } = do
+  res <- parseNixFileLoc file
   case res of
     Failure doc -> print doc
     Success expr -> do
-      print $ "Parsed nix file " ++ file path
-      traverse (handleUrl expr) urls
+      --print $ "Parsed nix file " ++ file path
+      traverse_ (handleUrl mng file expr) urls
       return ()
 
 main :: IO ()
 main = do
   contents <- BS.readFile "urls.json"
+  mng <- newManager (tlsManagerSettings {
+                        managerResponseTimeout = responseTimeoutMicro (10 * 1000 * 1000)
+                        })
   case eitherDecodeStrict' contents :: Either String [Entry] of
     Left error    -> print error
     Right entries -> do
       putStrLn $ "Handling " ++ show (length entries) ++ " entries"
-      mapM_ handleEntry entries
+      mapM_ (handleEntry mng) entries

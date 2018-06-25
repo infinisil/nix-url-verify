@@ -30,3 +30,7 @@ executable veri
                      , regex-tdfa
                      , megaparsec
                      , regex-applicative
+                     , http-client
+                     , http-client-tls
+                     , http-types
+                     , network-uri

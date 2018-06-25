@@ -15,7 +15,7 @@ let
     file = lib.concatStringsSep ":" (lib.reverseList (lib.tail x));
   };
 in 
-map (val: val // { path = getPosDes val.path; }) (
-filter (val: val.urls != [] && val.path != null) (
-map (name: { inherit name; path = getPos pkgs.${name}; urls = lib.flatten (getSrc pkgs.${name}); }) (
+map (val: val // { file = (getPosDes val.file).file; }) (
+filter (val: val.urls != [] && val.file != null) (
+map (name: { inherit name; file = getPos pkgs.${name}; urls = lib.flatten (getSrc pkgs.${name}); }) (
 filter (name: isDrvSafe pkgs.${name}) (builtins.attrNames pkgs))))
