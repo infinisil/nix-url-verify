@@ -34,3 +34,4 @@ executable veri
                      , http-client-tls
                      , http-types
                      , network-uri
+                     , monad-logger

@@ -7,6 +7,8 @@ module Main where
 
 import           Control.Exception.Base
 import           Control.Monad
+import           Control.Monad.Logger
+import           Control.Monad.Reader
 import           Data.Aeson                hiding (Success)
 import qualified Data.ByteString.Char8     as BS
 import           Data.Either
