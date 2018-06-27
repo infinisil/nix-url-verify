@@ -68,6 +68,7 @@ extractPattern (DoubleQuoted parts, span) = convertParts (span { spanBegin = (sp
   where
     convertParts :: SrcSpan -> [Antiquoted Text NExprLoc] -> Maybe ([(Text, SrcSpan)], Pattern)
     convertParts span [] = Just ([], Pattern [])
+    convertParts span (EscapedNewline:rest) = Nothing
     convertParts span (Plain text:rest) = do
       let endpoint = if Text.length text == 1 then sourceColumn (spanBegin span) else sourceColumn (spanBegin span) Data.Semigroup.<> mkPos (Text.length text - 1)
       let newspan = span { spanBegin = (spanBegin span) { sourceColumn = endpoint Data.Semigroup.<> pos1 } }
@@ -78,7 +79,6 @@ extractPattern (DoubleQuoted parts, span) = convertParts (span { spanBegin = (sp
                  { sourceColumn = endpoint }
                }) : spans
              , Pattern (Just text : patts))
-    convertParts span (EscapedNewline:rest) = Nothing
     convertParts span (Antiquoted (AnnE s val):rest) = do
       let len = unPos (sourceColumn (spanEnd s)) - unPos (sourceColumn (spanBegin s)) + 3
       let newspan = span { spanBegin = (spanBegin span) { sourceColumn = mkPos len Data.Semigroup.<> (sourceColumn (spanBegin span)) } }
@@ -107,7 +107,7 @@ updateUrl mng url = case parseURI url of
           --putStrLn "Is secure already"
           return url
         else do
-          let secureRequest = fromJust $ requestFromURI (uri { uriScheme = "https:" })
+          let secureRequest = (fromJust $ requestFromURI (uri { uriScheme = "https:" })) { redirectCount = 0 }
           putStrLn $ "Replacing with secure url (" ++ url ++ ")"
           handle (\(e :: SomeException) -> do
                      putStrLn $ "Got exception: " ++ show e
@@ -148,8 +148,8 @@ replaceInFile file (line, column) replacements = do
   --putStrLn $ "Replacing " ++ show oldline ++ " with " ++ show newline
   TIO.writeFile file (Text.unlines newlines)
 
-handleUrl :: Manager -> FilePath -> NExprLoc -> String -> IO ()
-handleUrl mng path expr url = case mapMaybe (matchString url) (findStrings expr) of
+handleUrl :: IO () -> Manager -> FilePath -> NExprLoc -> String -> IO ()
+handleUrl replaced mng path expr url = case mapMaybe (matchString url) (findStrings expr) of
   [] -> return ()--putStrLn $ "Url " ++ show url ++ " not found"
   [(sp, src, newpatt)] -> do
     -- src is the info on the original sections in our file
@@ -162,17 +162,18 @@ handleUrl mng path expr url = case mapMaybe (matchString url) (findStrings expr)
         replaceInFile path ((\x -> x - 1) . unPos . sourceLine . spanBegin . snd . head $ src, (\x -> x - 1) . unPos . sourceColumn . spanBegin $ sp)
           $ zipWith (\(_, span) newtext -> (unPos $ sourceColumn (spanBegin span), unPos $ sourceColumn (spanEnd span), newtext)) src newparts
         putStrLn $ "Changed from " ++ show url ++ " to " ++ show newurl
+        replaced
         where newparts = catMaybes res
   _ -> return () --putStrLn $ "Ambiguous url " ++ show url
 
 handleEntry :: Manager -> Entry -> IO ()
-handleEntry mng Entry { urls, file } = do
+handleEntry mng Entry { name, urls, file } = do
   res <- parseNixFileLoc file
   case res of
     Failure doc -> print doc
-    Success expr -> do
+    Success expr -> withFile "log" AppendMode $ \log -> do
       --print $ "Parsed nix file " ++ file path
-      traverse_ (handleUrl mng file expr) urls
+      traverse_ (handleUrl (hPutStrLn stderr name) mng file expr) urls
       return ()
 
 main :: IO ()
